@@ -20,6 +20,7 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // Blender (Z-up, right-handed) -> three/glTF (Y-up)
 const b2t = ([x, y, z]) => new THREE.Vector3(x, z, -y);
@@ -39,6 +40,18 @@ export async function mountOffice(container, opts = {}) {
     lens = 55,                // focal length (mm) for the perspective view, 36 mm sensor like Blender
     lampClicks = true,        // click a desk lamp to switch it on / off
     onLamp = null,            // (index, isOn) => void
+    blindClicks = true,       // click a window to roll its blind up / down
+    onBlind = null,           // (index, isUp) => void
+    purifierClicks = true,    // click the air purifier to start / stop it turning
+    onPurifier = null,        // (index, isTurning) => void
+    chairClicks = true,       // click a chair to slide it out from its desk / table and back
+    onChair = null,           // (index, isOut) => void
+    laptopClicks = true,      // click a laptop to close / open its lid
+    onLaptop = null,          // (index, isOpen) => void
+    drawerClicks = true,      // click a desk-pedestal drawer to open / close it
+    onDrawer = null,          // (index, isOpen) => void
+    doorClicks = true,        // click the meeting-room glass door to open / close it
+    onDoor = null,            // (isOpen) => void
   } = opts;
 
   const P = typeof params === 'string' ? await (await fetch(params)).json() : params;
@@ -308,25 +321,368 @@ export async function mountOffice(container, opts = {}) {
     return { p, box: toBox([x - 0.1, y - 0.1, z - 0.17], [x + 0.1, y + 0.1, z + 0.08]) };
   });
   function setLamp(p, on) { p.on = on; p.light.intensity = on ? p.base * (1 + (NIGHT.lamp - 1) * mood) : 0; }
+  lamps.forEach((l, i) => (l.click = () => { setLamp(l.p, !l.p.on); onLamp?.(i, l.p.on); }));
+
+  // ---- window blinds: click a window to roll its blind up into the cassette / back down ----
+  // Each window is <wall>_blind<n> (fabric), _bar<n> (bottom bar), _cass<n> (cassette) and _glass<n>;
+  // the back wall's windows are one InstancedMesh, so every instance is its own blind.
+  const blinds = [];
+  {
+    root.updateMatrixWorld(true);
+    const meshes = []; root.traverse(o => o.isMesh && meshes.push(o));
+    const m4 = new THREE.Matrix4();
+    const part = (mesh, i) => {
+      if (!mesh) return null;
+      const inst = mesh.isInstancedMesh, p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+      if (inst) mesh.getMatrixAt(i, m4); else m4.copy(mesh.matrix);
+      m4.decompose(p, q, s);
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+      const world = inst ? m4.clone().premultiply(mesh.matrixWorld) : mesh.matrixWorld;
+      return { p, q, s, p0: p.clone(), s0: s.clone(), geo: mesh.geometry.boundingBox,
+        box: mesh.geometry.boundingBox.clone().applyMatrix4(world),
+        apply() { if (inst) { mesh.setMatrixAt(i, m4.compose(p, q, s)); mesh.instanceMatrix.needsUpdate = true; } else { mesh.position.copy(p); mesh.scale.copy(s); } } };
+    };
+    for (const mesh of meshes) {
+      const m = mesh.name.match(/^(.*)_blind(\d+)$/); if (!m) continue;
+      const find = kind => meshes.find(o => o.name.startsWith(`${m[1]}_${kind}${m[2]}`));
+      const bar = find('bar'), cass = find('cass'), glass = find('glass');
+      for (let i = 0; i < (mesh.isInstancedMesh ? mesh.count : 1); i++) {
+        const b = { fabric: part(mesh, i), bar: part(bar, i), u: 0, anim: null };
+        b.box = [b.bar, part(cass, i), part(glass, i)].reduce((box, x) => (x ? box.union(x.box) : box), b.fabric.box.clone()).expandByScalar(0.02);
+        b.click = () => { const up = b.anim ? b.anim.to < 0.5 : b.u < 0.5; setBlind(b, up); onBlind?.(blinds.indexOf(b), up); };
+        blinds.push(b);
+      }
+    }
+  }
+  const ROLLED = 0.03;   // fabric left showing under the cassette when fully up
+  function poseBlind(b) {
+    const f = b.fabric, k = 1 - b.u * (1 - ROLLED);
+    const lift = (f.geo.max.y - f.geo.min.y) * f.s0.y * (1 - k);   // how far the bottom edge has risen
+    f.s.y = f.s0.y * k; f.p.y = f.p0.y + f.geo.max.y * f.s0.y * (1 - k); f.apply();   // top edge stays put
+    if (b.bar) { b.bar.p.y = b.bar.p0.y + lift; b.bar.apply(); }
+  }
+  function setBlind(b, up) {
+    const to = up ? 1 : 0;
+    b.anim = { t0: performance.now(), from: b.u, to, ms: Math.max(250, 1200 * Math.abs(to - b.u)) };
+    if (!autoRender) { b.u = to; b.anim = null; poseBlind(b); }
+  }
+  function stepBlinds(now) {
+    for (const b of blinds) {
+      if (!b.anim) continue;
+      const k = Math.min(1, (now - b.anim.t0) / b.anim.ms), e = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+      b.u = b.anim.from + (b.anim.to - b.anim.from) * e; poseBlind(b);
+      if (k >= 1) b.anim = null;
+    }
+  }
+
+  // ---- air purifier: click to start a slow continuous turn about its upright axis, click again to stop ----
+  // Its parts sit on the purifier's local Y axis, so a pivot at its origin turns it in place;
+  // the floor plate (Cube012) and foot (Circle) stay put.
+  const purifiers = [];
+  root.traverse(o => o.name === 'Air_Purifier' && purifiers.push(o));
+  const spins = purifiers.map((ap, i) => {
+    const pivot = new THREE.Group();
+    for (const c of [...ap.children]) if (!/^(Circle|Cube012)$/.test(c.name)) pivot.add(c);
+    ap.add(pivot);
+    const s = { pivot, box: new THREE.Box3().setFromObject(ap).expandByScalar(0.02), on: false, speed: 0 };
+    s.click = () => { s.on = !s.on; onPurifier?.(i, s.on); };
+    return s;
+  });
+  const SPIN = (Math.PI * 2) / 12;   // rad/s: one turn every 12 s
+  let lastSpin = 0;
+  function stepSpins(now) {
+    const dt = lastSpin ? Math.min(0.1, (now - lastSpin) / 1000) : 0; lastSpin = now;
+    for (const s of spins) {
+      s.speed += ((s.on ? SPIN : 0) - s.speed) * Math.min(1, dt * 3);   // ease up to speed, ease down to a stop
+      if (!s.on && s.speed < 1e-3) s.speed = 0;
+      s.pivot.rotation.y = (s.pivot.rotation.y + s.speed * dt) % (Math.PI * 2);
+    }
+  }
+
+  // ---- shared by chairs, laptops and the door ----
+  // Instanced furniture: each part is its own InstancedMesh holding one instance per copy of the model.
+  // Instanced nodes sit at the origin, unrotated, so a part's instance matrix is its world matrix.
+  const instanced = []; root.traverse(o => o.isInstancedMesh && instanced.push(o));
+  instanced.forEach(m => m.geometry.boundingBox || m.geometry.computeBoundingBox());
+  const m4 = new THREE.Matrix4(), v3 = new THREE.Vector3();
+  const worldAt = (m, k, out = new THREE.Matrix4()) => { m.getMatrixAt(k, out); return out.premultiply(m.matrixWorld); };
+  const centreAt = (m, k) => m.geometry.boundingBox.getCenter(new THREE.Vector3()).applyMatrix4(worldAt(m, k, m4));
+  // Split every InstancedMesh with `seed`'s count among seed's instances: a mesh joins when each of its
+  // instances lies within `radius` (horizontally) of a different seed instance. -> one part list per copy.
+  function instanceSets(seed, radius) {
+    const N = seed.count, at = [...Array(N)].map((_, k) => centreAt(seed, k)), sets = at.map(() => []);
+    for (const m of instanced) {
+      if (m.count !== N) continue;
+      const owner = [];
+      for (let k = 0; k < N; k++) {
+        const c = centreAt(m, k); let best = -1, bd = radius;
+        at.forEach((a, j) => { const d = Math.hypot(a.x - c.x, a.z - c.z); if (d < bd) { bd = d; best = j; } });
+        owner.push(best);
+      }
+      if (owner.includes(-1) || new Set(owner).size !== N) continue;   // belongs to some other model
+      owner.forEach((j, k) => sets[j].push({ mesh: m, k, m0: worldAt(m, k) }));
+    }
+    return sets;
+  }
+  const partsBox = parts => parts.reduce((b, p) => b.union(p.mesh.geometry.boundingBox.clone().applyMatrix4(p.m0)), new THREE.Box3());
+  const partsPoints = parts => {   // every 3rd vertex, in world space
+    const pts = [];
+    for (const p of parts) {
+      const a = p.mesh.geometry.attributes.position;
+      for (let i = 0; i < a.count; i += 3) pts.push(new THREE.Vector3().fromBufferAttribute(a, i).applyMatrix4(p.m0));
+    }
+    return pts;
+  };
+  const mean = arr => arr.reduce((s, q) => s.add(q), new THREE.Vector3()).divideScalar(arr.length);
+  function setPart(p, mat) {
+    p.mesh.instanceMatrix.array.set(mat.elements, p.k * 16);
+    p.mesh.instanceMatrix.needsUpdate = true;
+    p.mesh.boundingSphere = null;   // re-fit for frustum culling
+  }
+  // exact hit test against an object's own parts (instanced parts or plain meshes), so a click on
+  // whatever sits beside it doesn't count
+  const probe = new THREE.Mesh(); probe.matrixAutoUpdate = false;
+  function partsHit(parts, meshes, r) {
+    let t = Infinity;
+    for (const p of parts) {
+      probe.geometry = p.mesh.geometry; probe.material = p.mesh.material; worldAt(p.mesh, p.k, probe.matrixWorld);
+      const h = r.intersectObject(probe, false)[0]; if (h && h.distance < t) t = h.distance;
+    }
+    for (const h of r.intersectObjects(meshes, false)) if (h.distance < t) t = h.distance;
+    return t < Infinity ? t : null;
+  }
+  // The export packs flat colours into palette textures, each mesh's UVs pinned on its colour's texel:
+  // new geometry borrows the UV of the mesh whose material it uses.
+  function paletteUV(geo, from) {
+    const uv = from.geometry.attributes.uv;
+    if (uv) geo.setAttribute('uv', new THREE.Float32BufferAttribute(new Array(geo.attributes.position.count).fill([uv.getX(0), uv.getY(0)]).flat(), 2));
+    return geo;
+  }
+  // click-to-toggle with an eased 0 -> 1 run; each item has u, anim and pose()
+  const easeIO = k => (k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2);
+  const isOn = it => (it.anim ? it.anim.to === 1 : it.u === 1);
+  function toggleTo(it, on, ms) {
+    const to = on ? 1 : 0;
+    it.anim = { t0: performance.now(), from: it.u, to, ms: Math.max(200, ms * Math.abs(to - it.u)) };
+    if (!autoRender) { it.u = to; it.anim = null; it.pose(); }
+  }
+  function stepToggles(list, now) {
+    for (const it of list) {
+      if (!it.anim) continue;
+      const k = Math.min(1, (now - it.anim.t0) / it.anim.ms);
+      it.u = it.anim.from + (it.anim.to - it.anim.from) * easeIO(k); it.pose();
+      if (k >= 1) it.anim = null;
+    }
+  }
+
+  // ---- chairs: click a chair to slide it out from its desk / table, click again to push it back in ----
+  // A seed part names each chair model. The top of the backrest leans away from the desk, so
+  // base -> backrest top is the way the chair slides out.
+  const CHAIR_SEEDS = ['Cylinder105', 'Plane030'];   // mesh-back desk chair: base hub; meeting chair: shell
+  const PULL = 0.35;                                 // metres a chair slides out
+  const chairs = [];
+  {
+    let room = null; root.traverse(o => o.name === 'Floor' && (room = new THREE.Box3().setFromObject(o)));
+    for (const seedName of CHAIR_SEEDS) {
+      const seed = instanced.find(m => m.name === seedName); if (!seed) continue;
+      for (const parts of instanceSets(seed, 0.45)) {
+        const box = partsBox(parts), pts = partsPoints(parts);
+        const top = mean(pts.filter(q => q.y > box.max.y - 0.08)), base = mean(pts.filter(q => q.y < box.min.y + 0.12));
+        const dir = new THREE.Vector3(top.x - base.x, 0, top.z - base.z).normalize();
+        // don't slide through the room's outer walls
+        let pull = PULL;
+        if (room) for (const ax of ['x', 'z']) {
+          if (dir[ax] > 1e-3) pull = Math.min(pull, (room.max[ax] - 0.03 - box.max[ax]) / dir[ax]);
+          if (dir[ax] < -1e-3) pull = Math.min(pull, (room.min[ax] + 0.03 - box.min[ax]) / dir[ax]);
+        }
+        const offset = dir.multiplyScalar(Math.max(0, pull));
+        const ch = { parts, offset, u: 0, anim: null, box: box.clone().union(box.clone().translate(offset)) };
+        ch.pose = () => { for (const p of parts) setPart(p, m4.copy(p.m0).setPosition(v3.setFromMatrixPosition(p.m0).addScaledVector(offset, ch.u))); };
+        ch.click = () => { const out = !isOn(ch); toggleTo(ch, out, 700); onChair?.(chairs.indexOf(ch), out); };
+        ch.hit = r => partsHit(parts, [], r);
+        chairs.push(ch);
+      }
+    }
+  }
+
+  // ---- laptops: click a laptop to fold its lid shut, click again to open it ----
+  // The lid of each laptop model is one multi-part node (named here by its first part); the rest of the
+  // laptop is whatever instanced parts sit on the same spot. Shut, the lid lies screen-down on the
+  // keyboard deck with its back flush over the base's back edge. The whole motion is one rigid turn about
+  // a single fixed hinge line, solved so that it lands exactly there: nothing slides or lifts on the way.
+  const LAPTOP_LIDS = ['Cube078', 'Cube026'];   // desk laptops, meeting-table laptops
+  const laptops = [];
+  for (const lidName of LAPTOP_LIDS) {
+    const first = instanced.find(m => m.name === lidName); if (!first) continue;
+    const lidMeshes = first.parent === root ? [first] : first.parent.children.filter(c => c.isInstancedMesh);
+    for (const parts of instanceSets(first, 0.25)) {
+      const lid = parts.filter(p => lidMeshes.includes(p.mesh)), body = parts.filter(p => !lidMeshes.includes(p.mesh));
+      const lp = partsPoints(lid), bp = partsPoints(body);
+      // box centres, not vertex means: the meshes' vertices are bunched unevenly along the lid
+      const mid = arr => new THREE.Box3().setFromPoints(arr).getCenter(new THREE.Vector3());
+      const lo = Math.min(...lp.map(q => q.y)), hi = Math.max(...lp.map(q => q.y));
+      const bottom = lp.filter(q => q.y < lo + 0.004);
+      const toKeys = mid(bp).sub(mid(bottom)).setY(0).normalize();         // across the keyboard, level
+      const axis = new THREE.Vector3().crossVectors(toKeys, new THREE.Vector3(0, 1, 0));   // along the hinge
+      const up = mid(lp.filter(q => q.y > hi - 0.01)).sub(mid(bottom));
+      up.addScaledVector(axis, -up.dot(axis)).normalize();
+      const shut = new THREE.Quaternion().setFromUnitVectors(up, toKeys); // open -> shut, about the hinge line
+      // Fold forward about the screen's bottom edge (where a real hinge line runs), so the back of the lid
+      // rises over the base instead of dipping into it; then sit the screen face on the deck.
+      const edgeS = Math.max(...bottom.map(q => q.dot(toKeys)));
+      const edge = mid(bottom); edge.addScaledVector(toKeys, edgeS - edge.dot(toKeys)); edge.y = lo;
+      const deck = Math.max(...bp.map(q => q.y));
+      const shutLow = Math.min(...lp.map(q => q.clone().sub(edge).applyQuaternion(shut).y)) + edge.y;
+      const rise = deck + 0.0008 - shutLow;
+      // turn-about-edge then rise == one turn about a fixed point P: (R - I)(P - edge) = -rise·up,
+      // solved in the plane square to the hinge (basis toKeys, up)
+      const Rk = toKeys.clone().applyQuaternion(shut), Ry = new THREE.Vector3(0, 1, 0).applyQuaternion(shut);
+      const a11 = Rk.dot(toKeys) - 1, a12 = Ry.dot(toKeys), a21 = Rk.y, a22 = Ry.y - 1, det = a11 * a22 - a12 * a21;
+      const ds = (a12 * rise) / det, dy = (-a11 * rise) / det;            // Cramer's rule for rhs (0, -rise)
+      const hinge = edge.clone().addScaledVector(toKeys, ds); hinge.y += dy;
+      const lt = { parts, u: 0, anim: null, box: partsBox(parts).expandByScalar(0.01) };
+      const q = new THREE.Quaternion(), pivot = new THREE.Matrix4(), turn = new THREE.Matrix4(), back = new THREE.Matrix4().makeTranslation(-hinge.x, -hinge.y, -hinge.z);
+      lt.pose = () => {
+        q.identity().slerp(shut, lt.u);
+        pivot.makeTranslation(hinge.x, hinge.y, hinge.z).multiply(turn.makeRotationFromQuaternion(q)).multiply(back);
+        for (const p of lid) setPart(p, m4.multiplyMatrices(pivot, p.m0));
+      };
+      lt.click = () => { const shutNow = !isOn(lt); toggleTo(lt, shutNow, 900); onLaptop?.(laptops.indexOf(lt), !shutNow); };
+      lt.hit = r => partsHit(parts, [], r);
+      laptops.push(lt);
+    }
+  }
+
+  // ---- desk pedestals: click a drawer to slide it out, click again to close it ----
+  // Each storage unit at the end of a desk pair is one instanced model with a pedestal at both ends
+  // (its depth runs along the model's local x), each pedestal a small top drawer with a fingerprint
+  // lock over a deep bottom drawer. The export merged both ends into each mesh, so the drawer meshes
+  // are split at the unit's middle into a -x and a +x half; every drawer then moves on its own.
+  const DRAWER_TOP = ['Plane044', 'Plane039', 'Plane039_1'];   // top drawer tray, lock reader, lock bezel
+  const DRAWER_LOW = ['Plane037'];                             // bottom drawer front (Plane040 above it is the case's shelf)
+  const DRAWER_OUT = 0.38;                                     // metres a drawer slides out
+  const drawers = [];
+  {
+    const byName = n => instanced.find(m => m.name === n);
+    const halves = new Map();   // mesh -> [-x half, +x half]
+    const split = mesh => {
+      const g = mesh.geometry, pos = g.attributes.position, idx = g.index, mid = (g.boundingBox.min.x + g.boundingBox.max.x) / 2;
+      const lists = [[], []];
+      for (let i = 0; i < (idx ? idx.count : pos.count); i += 3) {
+        const t = [0, 1, 2].map(j => (idx ? idx.getX(i + j) : i + j));
+        lists[(pos.getX(t[0]) + pos.getX(t[1]) + pos.getX(t[2])) / 3 < mid ? 0 : 1].push(...t);
+      }
+      const out = lists.map((list, s) => {
+        const h = new THREE.InstancedMesh(g.clone().setIndex(list), mesh.material, mesh.count);
+        h.name = `${mesh.name}_${s ? 'px' : 'nx'}`; h.castShadow = mesh.castShadow; h.receiveShadow = mesh.receiveShadow;
+        h.instanceMatrix.array.set(mesh.instanceMatrix.array); h.geometry.computeBoundingBox();
+        mesh.parent.add(h); return h;
+      });
+      mesh.removeFromParent(); halves.set(mesh, out);
+      return out;
+    };
+    const top = DRAWER_TOP.map(byName), low = DRAWER_LOW.map(byName);
+    if (top[0] && low[0] && [...top, ...low].every(m => m && m.count === top[0].count)) {
+      // the bottom drawers are only fronts in the model: give each a tray behind it, in the front's
+      // own local space (front faces at x = ±1, unit centre at x = 0), so it travels with it
+      const fb = low[0].geometry.boundingBox, T = 0.025;
+      const tray = s => {
+        const x0 = s * 0.06, x1 = s * (fb.max.x - 0.04), cx = (x0 + x1) / 2, d = Math.abs(x1 - x0);
+        const y0 = fb.min.y + 0.05, y1 = fb.max.y - 0.16, w = (fb.max.z - fb.min.z) - 0.06;
+        const panel = (sx, sy, sz, x, y, z) => new THREE.BoxGeometry(sx, sy, sz).translate(x, y, z);
+        const geo = mergeGeometries([
+          panel(d, T, w, cx, y0, 0),                                      // floor
+          panel(d, y1 - y0, T, cx, (y0 + y1) / 2, -w / 2), panel(d, y1 - y0, T, cx, (y0 + y1) / 2, w / 2),   // sides
+          panel(T, y1 - y0, w, x0, (y0 + y1) / 2, 0),                     // back
+        ]);
+        const m = new THREE.InstancedMesh(paletteUV(geo, top[0]), top[0].material, low[0].count);
+        m.instanceMatrix.array.set(low[0].instanceMatrix.array); m.castShadow = m.receiveShadow = true;
+        m.geometry.computeBoundingBox(); root.add(m); return m;
+      };
+      const topH = top.map(split), lowH = low.map(split), trays = [tray(-1), tray(1)];
+      const q = new THREE.Quaternion();
+      for (let k = 0; k < top[0].count; k++) {
+        worldAt(top[0], k, m4).decompose(v3, q, new THREE.Vector3());
+        for (const s of [0, 1]) {
+          const out = new THREE.Vector3(s ? 1 : -1, 0, 0).applyQuaternion(q).setY(0).normalize().multiplyScalar(DRAWER_OUT);
+          for (const meshes of [topH.map(h => h[s]), [...lowH.map(h => h[s]), trays[s]]]) {
+            const parts = meshes.map(mesh => ({ mesh, k, m0: worldAt(mesh, k) }));
+            const box = partsBox(parts);
+            const dr = { parts, u: 0, anim: null, box: box.clone().union(box.clone().translate(out)) };
+            dr.pose = () => { for (const p of parts) setPart(p, m4.copy(p.m0).setPosition(v3.setFromMatrixPosition(p.m0).addScaledVector(out, dr.u))); };
+            dr.click = () => { const open = !isOn(dr); toggleTo(dr, open, 600); onDrawer?.(drawers.indexOf(dr), open); };
+            dr.hit = r => partsHit(parts, [], r);
+            drawers.push(dr);
+          }
+        }
+      }
+    }
+  }
+
+  // ---- meeting-room glass door: fills the opening in the front partition, click to swing it open / shut ----
+  // Sized from the scene: between the two posts either side of the glass header, floor to header.
+  const doors = [];
+  {
+    let header = null, posts = null, rail = null, band = null;
+    root.traverse(o => {
+      if (o.name === 'GDoorHeader') header = o; if (o.name === 'GPostF0') posts = o;
+      if (o.name === 'GRailBotF') rail = o; if (o.name === 'GBandF') band = o;
+    });
+    if (header && posts) {
+      const hb = new THREE.Box3().setFromObject(header), z = (hb.min.z + hb.max.z) / 2;
+      const pb = [...Array(posts.count)].map((_, k) => posts.geometry.boundingBox.clone().applyMatrix4(worldAt(posts, k)));
+      const near = (x, side) => pb.filter(b => b.min.z < z && b.max.z > z).sort((a, b) => Math.abs(a[side].x - x) - Math.abs(b[side].x - x))[0];
+      const x0 = near(hb.min.x, 'max').max.x + 0.008, x1 = near(hb.max.x, 'min').min.x - 0.008;   // 8 mm reveals
+      const W = x1 - x0, H = hb.min.y - 0.01, T = 0.012;
+      const door = new THREE.Group();
+      door.position.set(x1, 0, z);                      // hinged on the corner-post side
+      const add = (geo, from, x, y, zz = 0) => {
+        const m = new THREE.Mesh(paletteUV(geo, from), from.material); m.position.set(x, y, zz);
+        m.castShadow = !from.material.transparent; m.receiveShadow = true; door.add(m); return m;
+      };
+      const glass = header, metal = rail ?? posts;
+      add(new THREE.BoxGeometry(W, H - 0.06, T), glass, -W / 2, 0.06 + (H - 0.06) / 2);    // glass leaf
+      add(new THREE.BoxGeometry(W, 0.06, 0.034), metal, -W / 2, 0.03 + 0.004);             // bottom shoe, like the partition's rail
+      add(new THREE.BoxGeometry(W, 0.03, 0.026), metal, -W / 2, H - 0.015);                // top rail
+      if (band) add(new THREE.BoxGeometry(W, 0.12, T + 0.004), band, -W / 2, 1.2);         // manifestation band, as on the panes
+      for (const s of [1, -1]) {                                                              // pull handle, both faces
+        add(new THREE.CylinderGeometry(0.011, 0.011, 0.9, 16), metal, -W + 0.09, 1.05, s * 0.055);
+        for (const y of [0.68, 1.42]) add(new THREE.CylinderGeometry(0.007, 0.007, 0.05, 12).rotateX(Math.PI / 2), metal, -W + 0.09, y, s * 0.031);
+      }
+      root.add(door);
+      door.updateMatrixWorld(true);
+      const meshes = door.children;
+      // swings into the meeting room towards its side glass, stopping 5° short so the room-side handle clears it
+      const OPEN = THREE.MathUtils.degToRad(85);
+      const d = { u: 0, anim: null, door, box: new THREE.Box3().setFromObject(door).union(new THREE.Box3(new THREE.Vector3(x1 - 0.2, 0, z - W - 0.1), new THREE.Vector3(x1 + 0.1, H, z))) };
+      d.pose = () => { door.rotation.y = -OPEN * d.u; };
+      d.click = () => { const open = !isOn(d); toggleTo(d, open, 1100); onDoor?.(open); };
+      d.hit = r => partsHit([], meshes, r);
+      doors.push(d);
+    }
+  }
+
   const ray = new THREE.Raycaster(), ndc = new THREE.Vector2(), hitPt = new THREE.Vector3();
-  function lampAt(x, y) {
+  const clickables = [...(lampClicks ? lamps : []), ...(blindClicks ? blinds : []), ...(purifierClicks ? spins : []), ...(chairClicks ? chairs : []), ...(laptopClicks ? laptops : []), ...(drawerClicks ? drawers : []), ...(doorClicks ? doors : [])];
+  function pickAt(x, y) {
     const r = renderer.domElement.getBoundingClientRect();
     ndc.set(((x - r.left) / r.width) * 2 - 1, -((y - r.top) / r.height) * 2 + 1);
     ray.setFromCamera(ndc, cam);
     let best = null, bestT = Infinity;
-    for (const l of lamps) if (ray.ray.intersectBox(l.box, hitPt)) {
-      const t = hitPt.distanceTo(ray.ray.origin); if (t < bestT) { bestT = t; best = l; }
+    for (const l of clickables) if (ray.ray.intersectBox(l.box, hitPt)) {
+      const t = l.hit ? l.hit(ray) : hitPt.distanceTo(ray.ray.origin);
+      if (t != null && t < bestT) { bestT = t; best = l; }
     }
     return best;
   }
-  if (lampClicks && lamps.length) {
+  if (clickables.length) {
     const el = renderer.domElement; let down = null;
-    el.addEventListener('pointermove', e => { if (!down) el.style.cursor = lampAt(e.clientX, e.clientY) ? 'pointer' : ''; });
+    el.addEventListener('pointermove', e => { if (!down) el.style.cursor = pickAt(e.clientX, e.clientY) ? 'pointer' : ''; });
     el.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY }; });
     el.addEventListener('pointerup', e => {
       if (!down) return; const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y); down = null;
       if (moved > 6) return;                               // that was an orbit drag, not a click
-      const l = lampAt(e.clientX, e.clientY); if (l) { setLamp(l.p, !l.p.on); onLamp?.(lamps.indexOf(l), l.p.on); }
+      pickAt(e.clientX, e.clientY)?.click();
     });
   }
 
@@ -368,6 +724,9 @@ export async function mountOffice(container, opts = {}) {
     const tick = now => {
       raf = requestAnimationFrame(tick);
       stepFly(now);
+      stepBlinds(now);
+      stepSpins(now);
+      stepToggles(chairs, now); stepToggles(laptops, now); stepToggles(drawers, now); stepToggles(doors, now);
       if (Math.abs(mood - moodTarget) > 1e-3) { mood += (moodTarget - mood) * 0.08; applyMood(mood); }
       if (!fly) orbit?.update();
       render();
@@ -386,6 +745,12 @@ export async function mountOffice(container, opts = {}) {
       const z = zones.find(z => z.name === name); if (z) focusBox(z.box);
     },
     lamps: { count: lamps.length, isOn: i => lamps[i]?.p.on, toggle(i) { const l = lamps[i]; if (l) setLamp(l.p, !l.p.on); return l?.p.on; }, setAll(on) { lamps.forEach(l => setLamp(l.p, on)); } },
+    blinds: { count: blinds.length, isUp: i => (blinds[i]?.anim ? blinds[i].anim.to === 1 : blinds[i]?.u === 1), set(i, up) { if (blinds[i]) setBlind(blinds[i], up); }, toggle(i) { blinds[i]?.click(); }, setAll(up) { blinds.forEach(b => setBlind(b, up)); } },
+    purifiers: { count: spins.length, isTurning: i => !!spins[i]?.on, set(i, on) { if (spins[i]) spins[i].on = on; }, toggle(i) { spins[i]?.click(); } },
+    chairs: { count: chairs.length, isOut: i => !!chairs[i] && isOn(chairs[i]), set(i, out) { if (chairs[i]) toggleTo(chairs[i], out, 700); }, toggle(i) { chairs[i]?.click(); }, setAll(out) { chairs.forEach(c => toggleTo(c, out, 700)); } },
+    laptops: { count: laptops.length, isOpen: i => !!laptops[i] && !isOn(laptops[i]), set(i, open) { if (laptops[i]) toggleTo(laptops[i], !open, 900); }, toggle(i) { laptops[i]?.click(); }, setAll(open) { laptops.forEach(l => toggleTo(l, !open, 900)); } },
+    drawers: { count: drawers.length, isOpen: i => !!drawers[i] && isOn(drawers[i]), set(i, open) { if (drawers[i]) toggleTo(drawers[i], open, 600); }, toggle(i) { drawers[i]?.click(); }, setAll(open) { drawers.forEach(d => toggleTo(d, open, 600)); } },
+    door: { exists: doors.length > 0, get isOpen() { return !!doors[0] && isOn(doors[0]); }, set(open) { if (doors[0]) toggleTo(doors[0], open, 1100); }, toggle() { doors[0]?.click(); } },
     setNight(on) { moodTarget = on ? 1 : 0; if (!autoRender) { mood = moodTarget; applyMood(mood); } },
     get night() { return moodTarget === 1; },
     resetView(animated = false) {

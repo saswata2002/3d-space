@@ -5,6 +5,7 @@ An interactive 3D office, built in Blender and rendered in the browser with thre
 - Toggle the camera between the Blender isometric view and a 55 mm perspective lens.
 - Jump between areas (Overview, Meeting room, Workstations, Reception).
 - Switch between day and night lighting.
+- Click a desk lamp to switch it on / off, a window to roll its blind up / down, a chair to slide it out from its desk, a laptop to close its lid, a desk-pedestal drawer to open it, the meeting-room glass door to open it, or the air purifier to set it turning (click again to undo each).
 
 ## Run locally
 

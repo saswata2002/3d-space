@@ -2,9 +2,9 @@
 
 An interactive 3D office, built in Blender and rendered in the browser with three.js.
 
-- Hover any object to see its name and real-world size; click to focus the camera on it.
+- Toggle the camera between the Blender isometric view and a 55 mm perspective lens.
 - Jump between areas (Overview, Meeting room, Workstations, Reception).
-- Switch between day and night, and turn individual desk lamps on or off.
+- Switch between day and night lighting.
 
 ## Run locally
 
@@ -25,7 +25,7 @@ npx serve .
 <script type="module">
   import { mountOffice } from './office-scene.js';
   const view = await mountOffice(document.getElementById('app'), { glb: './office.glb', params: './scene.json' });
-  // view.focusZone('Meeting room'); view.setNight(true); view.resetView(true);
+  // view.setView('persp'); view.focusZone('Meeting room'); view.setNight(true); view.resetView(true);
 </script>
 ```
 

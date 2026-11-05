@@ -14,7 +14,7 @@ body { background: var(--bg); color: var(--ink); font-family: var(--ui); overflo
 .bar { position: fixed; left: 0; right: 0; top: 0; display: flex; gap: 10px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap;
   padding-top: calc(env(safe-area-inset-top, 0px) + 14px); padding-bottom: 8px;
   padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); pointer-events: none; z-index: 2; }
-.tag, .ctl > *, #info { pointer-events: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; backdrop-filter: blur(10px); }
+.tag, .ctl > * { pointer-events: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; backdrop-filter: blur(10px); }
 .tag { padding: 8px 12px; min-width: 0; }
 .tag h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: .01em; }
 .tag p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
@@ -26,14 +26,6 @@ button { font: 600 13px var(--ui); color: var(--ink); background: var(--panel); 
 button:hover { border-color: var(--accent); }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 #mood[aria-pressed="true"] { background: #1F2540; border-color: #5C6BC0; }
-#tip { position: fixed; z-index: 4; pointer-events: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px; font-size: 12px; white-space: nowrap; backdrop-filter: blur(8px); }
-#tip b { font-weight: 600; } #tip span { color: var(--muted); margin-left: 6px; font-variant-numeric: tabular-nums; }
-#info { position: fixed; z-index: 3; left: max(16px, env(safe-area-inset-left, 0px)); bottom: calc(env(safe-area-inset-bottom, 0px) + 16px); width: min(300px, calc(100vw - 32px)); padding: 14px 16px; }
-#info .zone { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--accent); }
-#info h2 { margin: 4px 0 10px; font-size: 18px; font-weight: 600; text-wrap: balance; }
-#info dl { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 0 0 12px; }
-#info dt { font-size: 11px; color: var(--muted); } #info dd { margin: 2px 0 0; font-size: 15px; font-variant-numeric: tabular-nums; }
-#info .row { display: flex; gap: 8px; }
 #load { position: fixed; inset: 0; pointer-events: none; display: grid; place-items: center; z-index: 5; background: var(--bg); transition: opacity .5s; }
 #load .box { width: min(280px, 70vw); text-align: center; font-size: 13px; color: var(--muted); }
 #load .track { height: 3px; background: var(--line); border-radius: 3px; margin-top: 10px; overflow: hidden; }
@@ -49,59 +41,43 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 <body>
 <div id="app"></div>
 <header class="bar">
-  <div class="tag"><h1>Office Diorama</h1><p id="hint">Hover anything · click to focus · click a lamp twice to switch it</p></div>
+  <div class="tag"><h1>Office Diorama</h1><p id="hint">Drag to orbit · scroll or pinch to zoom · right-drag to pan</p></div>
   <nav class="ctl" aria-label="View controls">
     <div class="seg" id="zones" role="group" aria-label="Go to area"></div>
+    <div class="seg" id="views" role="group" aria-label="Camera">
+      <button type="button" data-view="iso" aria-pressed="true">Isometric</button>
+      <button type="button" data-view="persp" aria-pressed="false">55 mm</button>
+    </div>
     <button id="mood" type="button" aria-pressed="false">Night</button>
     <button id="reset" type="button">Reset view</button>
   </nav>
 </header>
-<div id="tip" hidden></div>
-<aside id="info" hidden aria-live="polite">
-  <div class="zone" id="iz"></div>
-  <h2 id="in"></h2>
-  <dl><div><dt>Width</dt><dd id="iw"></dd></div><div><dt>Depth</dt><dd id="id"></dd></div><div><dt>Height</dt><dd id="ih"></dd></div></dl>
-  <div class="row"><button id="lamp" type="button" hidden>Switch off</button><button id="close" type="button">Close</button></div>
-</aside>
 <div id="load"><div class="box"><span id="msg">Loading office model…</span><div class="track"><div class="fill" id="fill"></div></div></div></div>
 
 <script type="module">
 import { mountOffice } from './office-scene.js';
 const GLB = './office.glb', PARAMS = './scene.json';
 const $ = id => document.getElementById(id);
-const fill = $('fill'), tip = $('tip'), info = $('info');
-let last = null;
+const fill = $('fill');
 try {
   const view = await mountOffice($('app'), {
     glb: GLB, params: PARAMS, controls: true,
     pixelRatio: Math.min(window.devicePixelRatio, 1.5),
     onProgress: p => { fill.style.width = Math.round(p * 100) + '%'; },
-    onHover: (it, x, y) => {
-      if (!it) { tip.hidden = true; return; }
-      tip.innerHTML = `<b>${it.label}</b><span>${it.dims.w} × ${it.dims.d} × ${it.dims.h} cm</span>`;
-      tip.hidden = false;
-      const w = tip.offsetWidth; tip.style.left = Math.min(x + 14, innerWidth - w - 12) + 'px'; tip.style.top = (y + 16) + 'px';
-    },
-    onSelect: it => {
-      last = it; info.hidden = !it; if (!it) return;
-      $('iz').textContent = it.zone; $('in').textContent = it.label;
-      $('iw').textContent = it.dims.w + ' cm'; $('id').textContent = it.dims.d + ' cm'; $('ih').textContent = it.dims.h + ' cm';
-      const lb = $('lamp'); lb.hidden = it.key !== 'LAMP';
-      if (it.key === 'LAMP') lb.textContent = view.lampOn(it.lamp) ? 'Switch off' : 'Switch on';
-    },
   });
-  // area buttons
+  const press = (group, el) => group.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', x === el));
+  // areas
   const seg = $('zones');
   view.zones.forEach((z, i) => {
     const b = document.createElement('button'); b.type = 'button'; b.textContent = z; b.setAttribute('aria-pressed', i === 0);
-    b.onclick = () => { seg.querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', x === b)); info.hidden = true; view.focusZone(z); };
+    b.onclick = () => { press(seg, b); view.focusZone(z); };
     seg.appendChild(b);
   });
+  // camera: isometric <-> 55 mm
+  const views = $('views');
+  views.querySelectorAll('button').forEach(b => b.onclick = () => { press(views, b); view.setView(b.dataset.view); });
   $('mood').onclick = e => { const on = !view.night; view.setNight(on); e.currentTarget.setAttribute('aria-pressed', on); e.currentTarget.textContent = on ? 'Day' : 'Night'; };
-  $('reset').onclick = () => { view.focusZone('Overview'); info.hidden = true; seg.querySelectorAll('button').forEach((x, i) => x.setAttribute('aria-pressed', i === 0)); };
-  $('close').onclick = () => { view.select(null); };
-  $('lamp').onclick = () => { if (last && last.key === 'LAMP') { const on = view.toggleLamp(last.lamp); $('lamp').textContent = on ? 'Switch off' : 'Switch on'; } };
-  addEventListener('keydown', e => { if (e.key === 'Escape') view.select(null); });
+  $('reset').onclick = () => { view.resetView(true); press(seg, seg.querySelector('button')); };
   window.officeView = view;
   const l = $('load'); l.style.opacity = 0; setTimeout(() => (l.hidden = true), 600);
 } catch (e) {

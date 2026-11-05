@@ -5,7 +5,8 @@
 //
 // Everything that defines the look (camera, sun, window lights, world, exposure)
 // is read from scene.json, which is written by Blender at export time, so the
-// web view matches the Blender camera 1:1.
+// isometric view matches the Blender camera 1:1. A second, perspective view uses
+// a 55 mm lens on the same camera axis.
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
@@ -34,10 +35,8 @@ export async function mountOffice(container, opts = {}) {
     pixelRatio = Math.min(window.devicePixelRatio, 2),
     onProgress = null,
     autoRender = true,        // set false to render on demand via view.render()
-    interactive = true,       // hover / click picking, camera focus, lamps, day-night
-    onHover = null,           // (item | null, clientX, clientY) => void
-    onSelect = null,          // (item | null) => void
-    accent = 0xE58A3A,        // highlight colour
+    view = 'iso',             // 'iso' = Blender's orthographic camera, 'persp' = real lens
+    lens = 55,                // focal length (mm) for the perspective view, 36 mm sensor like Blender
   } = opts;
 
   const P = typeof params === 'string' ? await (await fetch(params)).json() : params;
@@ -68,16 +67,27 @@ export async function mountOffice(container, opts = {}) {
     pmrem.dispose();
   }
 
-  // ---------- camera (Blender ortho camera, incl. lens shift) ----------
+  // ---------- cameras: isometric (Blender ortho) + perspective (55 mm) ----------
   const C = P.camera;
-  const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, C.clip_start, C.clip_end);
-  cam.position.copy(b2t(C.location));
-  // Blender cameras here have no roll, so world-up gives the identical orientation
-  // (and keeps OrbitControls' orbit axis vertical)
-  cam.up.set(0, 1, 0);
   const target = b2t(C.target);
-  cam.lookAt(target);
-  scene.add(cam);
+  const isoCam = new THREE.OrthographicCamera(-1, 1, 1, -1, C.clip_start, C.clip_end);
+  isoCam.position.copy(b2t(C.location));
+  isoCam.up.set(0, 1, 0);           // Blender camera has no roll
+  isoCam.lookAt(target);
+  isoCam.updateMatrixWorld();
+  const homeDir = isoCam.position.clone().sub(target).normalize();
+  const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(isoCam.quaternion);
+  const ISO_DIST = isoCam.position.distanceTo(target);
+  const perspCam = new THREE.PerspectiveCamera(30, 1, 0.05, 400);
+  perspCam.up.set(0, 1, 0);
+  const SENSOR = 36;
+  const halfH = { iso: 0, w: 0 };
+  let perspHome = 30;              // distance at which the 55 mm view frames the room
+  let mode = view === 'persp' ? 'persp' : 'iso';
+  let cam = mode === 'iso' ? isoCam : perspCam;
+  const shiftY = C.shift_y * C.ortho_scale, shiftX = C.shift_x * C.ortho_scale;
+  const homeTarget = target.clone().addScaledVector(camUp, shiftY)
+    .addScaledVector(new THREE.Vector3(1, 0, 0).applyQuaternion(isoCam.quaternion), shiftX);
 
   function fitCamera() {
     const w = container.clientWidth || window.innerWidth;
@@ -85,14 +95,19 @@ export async function mountOffice(container, opts = {}) {
     const aspect = w / h;
     const renderAspect = C.res_x / C.res_y;
     // Blender 'AUTO' sensor fit: ortho_scale spans the larger render dimension
-    let halfW, halfH;
-    if (renderAspect >= 1) { halfW = C.ortho_scale / 2; halfH = halfW / renderAspect; }
-    else { halfH = C.ortho_scale / 2; halfW = halfH * renderAspect; }
-    // keep the Blender framing fully visible, extend the other axis
-    if (aspect > halfW / halfH) halfW = halfH * aspect; else halfH = halfW / aspect;
-    const sx = C.shift_x * C.ortho_scale, sy = C.shift_y * C.ortho_scale;
-    cam.left = -halfW + sx; cam.right = halfW + sx; cam.top = halfH + sy; cam.bottom = -halfH + sy;
-    cam.updateProjectionMatrix();
+    let hw, hh;
+    if (renderAspect >= 1) { hw = C.ortho_scale / 2; hh = hw / renderAspect; }
+    else { hh = C.ortho_scale / 2; hw = hh * renderAspect; }
+    if (aspect > hw / hh) hw = hh * aspect; else hh = hw / aspect;   // keep the framing, extend the other axis
+    isoCam.left = -hw + shiftX; isoCam.right = hw + shiftX; isoCam.top = hh + shiftY; isoCam.bottom = -hh + shiftY;
+    isoCam.updateProjectionMatrix();
+    halfH.iso = hh; halfH.w = hw;
+    // 55 mm on a 36 mm sensor, fitted to the wider side like Blender
+    const half = Math.atan(SENSOR / 2 / lens);
+    const vHalf = aspect >= 1 ? Math.atan(Math.tan(half) / aspect) : half;
+    perspCam.fov = THREE.MathUtils.radToDeg(vHalf * 2); perspCam.aspect = aspect; perspCam.updateProjectionMatrix();
+    const hHalf = Math.atan(Math.tan(vHalf) * aspect);
+    perspHome = Math.max((hw * 1.06) / Math.tan(hHalf), (hh * 1.06) / Math.tan(vHalf));
     renderer.setSize(w, h, false);
     renderer.domElement.style.width = '100%'; renderer.domElement.style.height = '100%';
     composer?.setSize(w, h);
@@ -195,121 +210,107 @@ export async function mountOffice(container, opts = {}) {
   });
   scene.add(root);
 
-  // ---------- post: AO + tone mapping ----------
-  var composer = new EffectComposer(renderer);
-  composer.addPass(new RenderPass(scene, cam));
-  if (ao) {
-    const gtao = new GTAOPass(scene, cam, 1, 1);
-    gtao.updateGtaoMaterial({ radius: 0.35, distanceExponent: 1.5, thickness: 1.0, scale: 1.0, samples: 16 });
-    gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 4, rings: 2, samples: 16 });
-    gtao.blendIntensity = P.web?.aoIntensity ?? 0.9;
-    composer.addPass(gtao);
-  }
-  composer.addPass(new OutputPass());
-  // Blender's "AgX - High Contrast" look: three only ships base AgX, so add the
-  // look's deeper toe on top (darks pushed down, highlights untouched).
+  // ---------- post: AO + tone mapping (rebuilt when the camera changes) ----------
   const toe = P.web?.lookToe ?? (String(P.look).includes('High Contrast') ? 0.87 : 0);
-  if (toe > 0) {
-    composer.addPass(new ShaderPass({
-      uniforms: { tDiffuse: { value: null }, uToe: { value: toe } },
-      vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
-      fragmentShader: `uniform sampler2D tDiffuse; uniform float uToe; varying vec2 vUv;
-        void main(){ vec4 c = texture2D(tDiffuse, vUv); vec3 x = clamp(c.rgb, 0.0, 1.0);
-          vec3 e = 1.0 + uToe * (1.0 - x) * (1.0 - x); gl_FragColor = vec4(pow(x, e), c.a); }`,
-    }));
+  let composer = null;
+  function buildComposer() {
+    composer?.dispose();
+    composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, cam));
+    if (ao) {
+      const gtao = new GTAOPass(scene, cam, 1, 1);
+      gtao.updateGtaoMaterial({ radius: 0.35, distanceExponent: 1.5, thickness: 1.0, scale: 1.0, samples: 16 });
+      gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 4, rings: 2, samples: 16 });
+      gtao.blendIntensity = P.web?.aoIntensity ?? 0.9;
+      composer.addPass(gtao);
+    }
+    composer.addPass(new OutputPass());
+    // Blender's "AgX - High Contrast" look: three only ships base AgX, so add the
+    // look's deeper toe on top (darks pushed down, highlights untouched).
+    if (toe > 0) {
+      composer.addPass(new ShaderPass({
+        uniforms: { tDiffuse: { value: null }, uToe: { value: toe } },
+        vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+        fragmentShader: `uniform sampler2D tDiffuse; uniform float uToe; varying vec2 vUv;
+          void main(){ vec4 c = texture2D(tDiffuse, vUv); vec3 x = clamp(c.rgb, 0.0, 1.0);
+            vec3 e = 1.0 + uToe * (1.0 - x) * (1.0 - x); gl_FragColor = vec4(pow(x, e), c.a); }`,
+      }));
+    }
+    const w = container.clientWidth || window.innerWidth, h = container.clientHeight || window.innerHeight;
+    composer.setSize(w, h);
   }
 
   // ---------- controls ----------
   let orbit = null;
   if (controls) {
     orbit = new OrbitControls(cam, renderer.domElement);
-    orbit.target.copy(target);
     orbit.enableDamping = true;
     orbit.minZoom = 0.6; orbit.maxZoom = 6;
+    orbit.minDistance = 3; orbit.maxDistance = 90;
     orbit.maxPolarAngle = Math.PI * 0.47;
-    orbit.update();
+  }
+  const curTarget = () => (orbit ? orbit.target : homeTarget);
+
+  // place a camera on the Blender view axis, `amount` = zoom (iso) or distance (persp)
+  function placeCam(c, tgt, dir, amount) {
+    if (c.isOrthographicCamera) { c.zoom = amount; c.position.copy(tgt).addScaledVector(dir, ISO_DIST); }
+    else c.position.copy(tgt).addScaledVector(dir, amount);
+    c.lookAt(tgt); c.updateProjectionMatrix();
+    if (orbit) orbit.target.copy(tgt);
   }
 
   fitCamera();
+  // iso keeps Blender's projection (target + lens shift handled by the frustum)
+  placeCam(isoCam, target, homeDir, 1);
+  placeCam(perspCam, homeTarget, homeDir, perspHome);
+  if (mode === 'iso') placeCam(isoCam, target, homeDir, 1);
+  if (orbit) { orbit.object = cam; orbit.target.copy(mode === 'iso' ? target : homeTarget); orbit.update(); }
+  buildComposer();
   const ro = new ResizeObserver(fitCamera); ro.observe(container);
 
-  // ================= interaction =================
-  const LABELS = {
-    CHAIR: 'Ergonomic mesh chair', MCHAIR: 'Conference chair', PAIR: 'Bench desk · 2 seats', DESK: 'Desk with drawers',
-    MONITOR: 'MacBook Pro 14″', MTABLE: 'Meeting table', PLANT: 'Ficus in concrete pot', PLANTB: 'Potted plant',
-    MONST: 'Monstera', SNAKE: 'Snake plant', KIT8: 'Leafy floor plant', DESKPL: 'Small snake plant', COOLER: 'Water cooler',
-    CAB: 'Sideboard', PRINTER: 'Printer', TALL: 'Air purifier', TV: '60″ wall TV', CLOCK: 'Wall clock', POSTER: 'Framed poster',
-    ART: 'Abstract print', KIT1: 'Desk accessories', KIT2: 'Desk accessories', KIT3: 'Desk accessories', LAPTOP: 'Laptop',
-    GLASS: 'Water glass', NOTE: 'Notebook', BOTTLE: 'Glass bottle', BINDER: 'Binder', BOOKS: 'Book stack', SUCC: 'Succulent',
-    TRAY: 'Letter tray', LAMP: 'Desk lamp',
-  };
-  const toBox = (mn, mx) => new THREE.Box3().setFromPoints([b2t(mn), b2t(mx)]);
-  const zones = Object.entries(P.zones || {}).filter(([, z]) => z).map(([name, z]) => ({ name, box: toBox(z.min, z.max) }));
-  const zoneOf = c => (zones.find(z => z.name !== 'Overview' && z.box.containsPoint(c)) || { name: 'Open office' }).name;
-  const items = (P.items || []).map((it, i) => {
-    const box = toBox(it.min, it.max); const c = box.getCenter(new THREE.Vector3());
-    const size = [it.max[0] - it.min[0], it.max[1] - it.min[1], it.max[2] - it.min[2]];
-    return { id: i, key: it.key, label: LABELS[it.key] || it.key, box, center: c, zone: zoneOf(c),
-      dims: { w: Math.round(Math.max(size[0], size[1]) * 100), d: Math.round(Math.min(size[0], size[1]) * 100), h: Math.round(size[2] * 100) } };
-  });
-  rig.point.forEach((p, i) => {          // desk lamps are clickable switches
-    const [x, y, z] = p.L.location;
-    const box = toBox([x - 0.09, y - 0.09, z - 0.16], [x + 0.09, y + 0.09, z + 0.07]); const c = box.getCenter(new THREE.Vector3());
-    items.push({ id: items.length, key: 'LAMP', label: 'Desk lamp', box, center: c, zone: zoneOf(c), lamp: i, dims: { w: 15, d: 15, h: 22 } });
-  });
-  const vol = b => { const s = b.getSize(new THREE.Vector3()); return s.x * s.y * s.z; };
-
-  // highlight overlay (drawn after post-processing so AO never touches it)
-  const overlay = new THREE.Scene();
-  const mkHi = (op) => {
-    const g = new THREE.Group();
-    const edges = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
-      new THREE.LineBasicMaterial({ color: accent, transparent: true, opacity: op, depthTest: false, toneMapped: false }));
-    const fill = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1),
-      new THREE.MeshBasicMaterial({ color: accent, transparent: true, opacity: op * 0.12, depthTest: false, depthWrite: false, toneMapped: false }));
-    g.add(edges, fill); g.visible = false; overlay.add(g); return g;
-  };
-  const hoverHi = mkHi(0.55), selHi = mkHi(1.0);
-  const place = (g, it) => {
-    if (!it) { g.visible = false; return; }
-    const s = it.box.getSize(new THREE.Vector3()).addScalar(0.04);
-    g.position.copy(it.center); g.scale.copy(s); g.visible = true;
-  };
-
-  const ray = new THREE.Raycaster(); const ndc = new THREE.Vector2(); const tmp = new THREE.Vector3();
-  function pick(clientX, clientY) {
-    const r = renderer.domElement.getBoundingClientRect();
-    ndc.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
-    ray.setFromCamera(ndc, cam);
-    const hits = [];
-    for (const it of items) if (ray.ray.intersectBox(it.box, tmp)) hits.push({ it, t: tmp.distanceTo(ray.ray.origin) });
-    if (!hits.length) return null;
-    const t0 = Math.min(...hits.map(h => h.t));
-    // among boxes the ray enters first, prefer the most specific (smallest) one
-    return hits.filter(h => h.t < t0 + 0.7).sort((a, b) => vol(a.it.box) - vol(b.it.box))[0].it;
-  }
-
-  // ---- smooth camera focus ----
-  const home = { target: target.clone(), pos: b2t(C.location), zoom: 1 };
+  // ---- smooth camera moves ----
   let fly = null;
-  function flyTo(tgt, zoom, ms = 900) {
-    const dir = cam.position.clone().sub(orbit ? orbit.target : target).normalize();
-    fly = { t0: performance.now(), ms, fromT: (orbit ? orbit.target : target).clone(), toT: tgt.clone(),
-      fromZ: cam.zoom, toZ: THREE.MathUtils.clamp(zoom, 0.6, 6), dir, dist: 40 };
-  }
-  function focusBox(box, pad = 1.6) {
-    const s = box.getSize(new THREE.Vector3()); const span = Math.max(s.x, s.y, s.z) * pad;
-    const viewH = cam.top - cam.bottom, viewW = cam.right - cam.left;
-    flyTo(box.getCenter(new THREE.Vector3()), Math.min(viewH, viewW) / Math.max(span, 0.6));
+  const amountOf = () => (cam.isOrthographicCamera ? cam.zoom : cam.position.distanceTo(curTarget()));
+  function flyTo(tgt, amount, dir = cam.position.clone().sub(curTarget()).normalize(), ms = 900) {
+    fly = { t0: performance.now(), ms, fromT: curTarget().clone(), toT: tgt.clone(), fromA: amountOf(), toA: amount,
+      fromD: cam.position.clone().sub(curTarget()).normalize(), toD: dir.clone().normalize() };
+    if (!autoRender) { stepFly(fly.t0 + ms); }
   }
   function stepFly(now) {
     if (!fly) return;
     const k = Math.min(1, (now - fly.t0) / fly.ms), e = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
     const t = fly.fromT.clone().lerp(fly.toT, e);
-    cam.zoom = fly.fromZ + (fly.toZ - fly.fromZ) * e; cam.updateProjectionMatrix();
-    cam.position.copy(t).addScaledVector(fly.dir, fly.dist); cam.lookAt(t);
-    if (orbit) orbit.target.copy(t);
+    const d = fly.fromD.clone().lerp(fly.toD, e).normalize();
+    // ease zoom/distance in log space so it feels even
+    const a = Math.exp(Math.log(fly.fromA) + (Math.log(fly.toA) - Math.log(fly.fromA)) * e);
+    placeCam(cam, t, d, a);
     if (k >= 1) fly = null;
+  }
+  function focusBox(box, pad = 1.15) {
+    const s = box.getSize(new THREE.Vector3()); const span = Math.max(s.x, s.z, s.y) * pad;
+    const c = box.getCenter(new THREE.Vector3());
+    if (cam.isOrthographicCamera) {
+      const viewH = (cam.top - cam.bottom), viewW = (cam.right - cam.left);
+      flyTo(c, THREE.MathUtils.clamp(Math.min(viewH, viewW) / Math.max(span, 0.6), 0.6, 6));
+    } else {
+      const vHalf = THREE.MathUtils.degToRad(perspCam.fov / 2);
+      flyTo(c, THREE.MathUtils.clamp((span / 2) / Math.tan(vHalf) * 1.1, 3, 90));
+    }
+  }
+  const toBox = (mn, mx) => new THREE.Box3().setFromPoints([b2t(mn), b2t(mx)]);
+  const zones = Object.entries(P.zones || {}).filter(([, z]) => z).map(([name, z]) => ({ name, box: toBox(z.min, z.max) }));
+
+  // ---- isometric <-> 55 mm ----
+  function setView(next) {
+    if (next === mode) return;
+    const tgt = curTarget().clone(), dir = cam.position.clone().sub(tgt).normalize();
+    // keep roughly the same framing when switching
+    const isoZoom = cam.isOrthographicCamera ? cam.zoom : perspHome / cam.position.distanceTo(tgt);
+    mode = next; cam = mode === 'iso' ? isoCam : perspCam;
+    fly = null;
+    placeCam(cam, tgt, dir, mode === 'iso' ? THREE.MathUtils.clamp(isoZoom, 0.6, 6) : THREE.MathUtils.clamp(perspHome / isoZoom, 3, 90));
+    if (orbit) { orbit.object = cam; orbit.update(); }
+    buildComposer();
   }
 
   // ---- day / night ----
@@ -324,43 +325,15 @@ export async function mountOffice(container, opts = {}) {
       a.light.intensity = a.base * L(1, a.window ? NIGHT.window : NIGHT.area);
       if (a.window) a.light.color.copy(a.color).lerp(nightWin, m);
     });
-    rig.point.forEach(p => (p.light.intensity = p.on ? p.base * L(1, NIGHT.lamp) : 0));
+    rig.point.forEach(p => (p.light.intensity = p.base * L(1, NIGHT.lamp)));
     if (rig.hemi) rig.hemi.light.intensity = rig.hemi.base * L(1, NIGHT.hemi);
     scene.environmentIntensity = baseEnv * L(1, NIGHT.env);
     scene.background.copy(baseBg).multiplyScalar(L(1, NIGHT.bg));
     renderer.toneMappingExposure = baseExp * Math.pow(2, L(0, NIGHT.exposure));
   }
 
-  // ---- pointer handling ----
-  let hovered = null, selected = null, down = null;
-  const el = renderer.domElement;
-  if (interactive) {
-    el.style.touchAction = 'none';
-    el.addEventListener('pointermove', e => {
-      if (e.pointerType !== 'mouse' && down) return;
-      const it = pick(e.clientX, e.clientY);
-      if (it !== hovered) { hovered = it; place(hoverHi, it && it !== selected ? it : null); }
-      el.style.cursor = it ? 'pointer' : '';
-      onHover?.(it, e.clientX, e.clientY);
-    });
-    el.addEventListener('pointerleave', () => { hovered = null; place(hoverHi, null); onHover?.(null); });
-    el.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY }; });
-    el.addEventListener('pointerup', e => {
-      if (!down) return; const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y); down = null;
-      if (moved > 6) return;                                   // that was an orbit drag
-      const it = pick(e.clientX, e.clientY);
-      if (it && it.key === 'LAMP' && selected === it) { api.toggleLamp(it.lamp); onSelect?.(it); return; }
-      api.select(it);
-    });
-  }
-
   let raf = 0;
-  const render = () => {
-    composer.render();
-    if (hoverHi.visible || selHi.visible) {
-      renderer.autoClear = false; renderer.clearDepth(); renderer.render(overlay, cam); renderer.autoClear = true;
-    }
-  };
+  const render = () => composer.render();
   if (autoRender) {
     const tick = now => {
       raf = requestAnimationFrame(tick);
@@ -373,25 +346,21 @@ export async function mountOffice(container, opts = {}) {
   }
 
   const api = {
-    scene, camera: cam, renderer, controls: orbit, render, items, zones: ['Overview', ...zones.map(z => z.name)],
-    select(it) {
-      selected = it || null; place(selHi, selected); place(hoverHi, null);
-      if (selected) focusBox(selected.box, selected.key === 'PAIR' || selected.key === 'MTABLE' ? 1.3 : 2.4);
-      onSelect?.(selected);
-    },
+    scene, renderer, controls: orbit, render,
+    get camera() { return cam; },
+    get view() { return mode; },
+    setView,
+    zones: ['Overview', ...zones.map(z => z.name)],
     focusZone(name) {
-      api.select(null);
       if (name === 'Overview') return api.resetView(true);
-      const z = zones.find(z => z.name === name); if (z) focusBox(z.box, 1.15);
+      const z = zones.find(z => z.name === name); if (z) focusBox(z.box);
     },
     setNight(on) { moodTarget = on ? 1 : 0; if (!autoRender) { mood = moodTarget; applyMood(mood); } },
     get night() { return moodTarget === 1; },
-    toggleLamp(i) { const p = rig.point[i]; if (!p) return; p.on = !p.on; applyMood(mood); return p.on; },
-    lampOn(i) { return rig.point[i]?.on; },
     resetView(animated = false) {
-      selected = null; place(selHi, null);
-      if (animated && autoRender) { cam.position.copy(cam.position); flyTo(home.target, 1); fly.dir = home.pos.clone().sub(home.target).normalize(); return; }
-      cam.position.copy(home.pos); cam.zoom = 1; cam.lookAt(home.target); orbit?.target.copy(home.target); cam.updateProjectionMatrix();
+      const tgt = mode === 'iso' ? target : homeTarget, amt = mode === 'iso' ? 1 : perspHome;
+      if (animated && autoRender) return flyTo(tgt, amt, homeDir);
+      fly = null; placeCam(cam, tgt, homeDir, amt); orbit?.update();
     },
     dispose() { cancelAnimationFrame(raf); ro.disconnect(); orbit?.dispose(); composer.dispose(); renderer.dispose(); container.removeChild(renderer.domElement); },
   };

@@ -37,6 +37,8 @@ export async function mountOffice(container, opts = {}) {
     autoRender = true,        // set false to render on demand via view.render()
     view = 'iso',             // 'iso' = Blender's orthographic camera, 'persp' = real lens
     lens = 55,                // focal length (mm) for the perspective view, 36 mm sensor like Blender
+    lampClicks = true,        // click a desk lamp to switch it on / off
+    onLamp = null,            // (index, isOn) => void
   } = opts;
 
   const P = typeof params === 'string' ? await (await fetch(params)).json() : params;
@@ -300,6 +302,34 @@ export async function mountOffice(container, opts = {}) {
   const toBox = (mn, mx) => new THREE.Box3().setFromPoints([b2t(mn), b2t(mx)]);
   const zones = Object.entries(P.zones || {}).filter(([, z]) => z).map(([name, z]) => ({ name, box: toBox(z.min, z.max) }));
 
+  // ---- desk lamps: click a lamp to switch its light on / off ----
+  const lamps = rig.point.map(p => {
+    const [x, y, z] = p.L.location;   // light sits inside the shade; box covers shade + base
+    return { p, box: toBox([x - 0.1, y - 0.1, z - 0.17], [x + 0.1, y + 0.1, z + 0.08]) };
+  });
+  function setLamp(p, on) { p.on = on; p.light.intensity = on ? p.base * (1 + (NIGHT.lamp - 1) * mood) : 0; }
+  const ray = new THREE.Raycaster(), ndc = new THREE.Vector2(), hitPt = new THREE.Vector3();
+  function lampAt(x, y) {
+    const r = renderer.domElement.getBoundingClientRect();
+    ndc.set(((x - r.left) / r.width) * 2 - 1, -((y - r.top) / r.height) * 2 + 1);
+    ray.setFromCamera(ndc, cam);
+    let best = null, bestT = Infinity;
+    for (const l of lamps) if (ray.ray.intersectBox(l.box, hitPt)) {
+      const t = hitPt.distanceTo(ray.ray.origin); if (t < bestT) { bestT = t; best = l; }
+    }
+    return best;
+  }
+  if (lampClicks && lamps.length) {
+    const el = renderer.domElement; let down = null;
+    el.addEventListener('pointermove', e => { if (!down) el.style.cursor = lampAt(e.clientX, e.clientY) ? 'pointer' : ''; });
+    el.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY }; });
+    el.addEventListener('pointerup', e => {
+      if (!down) return; const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y); down = null;
+      if (moved > 6) return;                               // that was an orbit drag, not a click
+      const l = lampAt(e.clientX, e.clientY); if (l) { setLamp(l.p, !l.p.on); onLamp?.(lamps.indexOf(l), l.p.on); }
+    });
+  }
+
   // ---- isometric <-> 55 mm ----
   function setView(next) {
     if (next === mode) return;
@@ -325,7 +355,7 @@ export async function mountOffice(container, opts = {}) {
       a.light.intensity = a.base * L(1, a.window ? NIGHT.window : NIGHT.area);
       if (a.window) a.light.color.copy(a.color).lerp(nightWin, m);
     });
-    rig.point.forEach(p => (p.light.intensity = p.base * L(1, NIGHT.lamp)));
+    rig.point.forEach(p => (p.light.intensity = p.on ? p.base * L(1, NIGHT.lamp) : 0));
     if (rig.hemi) rig.hemi.light.intensity = rig.hemi.base * L(1, NIGHT.hemi);
     scene.environmentIntensity = baseEnv * L(1, NIGHT.env);
     scene.background.copy(baseBg).multiplyScalar(L(1, NIGHT.bg));
@@ -355,6 +385,7 @@ export async function mountOffice(container, opts = {}) {
       if (name === 'Overview') return api.resetView(true);
       const z = zones.find(z => z.name === name); if (z) focusBox(z.box);
     },
+    lamps: { count: lamps.length, isOn: i => lamps[i]?.p.on, toggle(i) { const l = lamps[i]; if (l) setLamp(l.p, !l.p.on); return l?.p.on; }, setAll(on) { lamps.forEach(l => setLamp(l.p, on)); } },
     setNight(on) { moodTarget = on ? 1 : 0; if (!autoRender) { mood = moodTarget; applyMood(mood); } },
     get night() { return moodTarget === 1; },
     resetView(animated = false) {
